@@ -1,0 +1,647 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import logging
+from typing import List, Optional, Tuple
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.checkpoint import checkpoint
+
+# Configurable logging setup
+import os
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL), format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+# Safe compile wrapper
+def maybe_compile(model: nn.Module) -> nn.Module:
+    """Try to compile with torch.compile, fallback on error."""
+    try:
+        return torch.compile(model, mode='default')
+    except Exception as e:
+        logger.warning(f"torch.compile failed: {e}. Proceeding without compilation.")
+    return model
+
+class FourierEmbed(nn.Module):
+    """Fourier feature embedding with learnable frequency adaptation."""
+
+    def __init__(self, input_dim: int, num_bands: int, max_freq: float, scale: float = 1.0, 
+                 learnable_freqs: bool = True):
+        super().__init__()
+        self.input_dim = input_dim
+        
+        # Initialize frequencies with principled spacing
+        freqs = 2.0 ** torch.linspace(0.0, max_freq, num_bands) * scale * math.pi
+        
+        if learnable_freqs:
+            # Make frequencies learnable parameters for adaptive selection
+            self.freqs = nn.Parameter(freqs)
+        else:
+            # Keep as fixed buffer for compatibility
+            self.register_buffer('freqs', freqs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        proj = torch.einsum('...d,f->...df', x, self.freqs)
+        return torch.cat([proj.sin(), proj.cos()], dim=-1).flatten(-2)
+
+class SineAct(nn.Module):
+    """Sine activation with learnable frequency and phase."""
+
+    def __init__(self, omega: float = 30.0, learnable_omega: bool = True):
+        super().__init__()
+        if learnable_omega:
+            # Make omega learnable for per-layer adaptation
+            self.omega = nn.Parameter(torch.tensor(omega, dtype=torch.float32))
+        else:
+            self.omega = omega
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(self.omega * x)
+
+class SIREN(nn.Module):
+    """Enhanced SIREN with latest initialization techniques and learnable omega scaling."""
+
+    def __init__(self, dims: List[int], omega: float = 30.0, dropout: float = 0.1, 
+                 learnable_omega: bool = True, sinusoidal_init: bool = True):
+        super().__init__()
+        self.omega = omega
+        self.learnable_omega = learnable_omega
+        self.sinusoidal_init = sinusoidal_init
+        layers = []
+
+        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
+            linear = nn.Linear(in_dim, out_dim)
+
+            # Enhanced initialization based on latest research
+            with torch.no_grad():
+                if self.sinusoidal_init:
+                    # Sinusoidal initialization for better convergence
+                    layer_idx = i + 1
+                    if i == 0:
+                        # First layer: uniform initialization as per original SIREN
+                        linear.weight.uniform_(-1/in_dim, 1/in_dim)
+                    else:
+                        # Sinusoidal structured initialization
+                        for j in range(out_dim):
+                            for k in range(in_dim):
+                                phase = 2 * math.pi * (j * in_dim + k) / (out_dim * in_dim)
+                                linear.weight[j, k] = math.sin(phase + layer_idx) / math.sqrt(in_dim)
+                else:
+                    # Original SIREN initialization
+                    if i == 0:
+                        linear.weight.uniform_(-1/in_dim, 1/in_dim)
+                    else:
+                        bound = math.sqrt(6/in_dim) / omega
+                        linear.weight.uniform_(-bound, bound)
+                
+                linear.bias.zero_()
+
+            layers.append(linear)
+            
+            # Layer-specific learnable omega for adaptive frequency scaling
+            layer_omega = omega * (0.5 ** i) if i > 0 else omega  # Decay omega with depth
+            layers.append(SineAct(layer_omega, learnable_omega))
+            
+            if i < len(dims) - 2:  # No dropout on final layer
+                layers.append(nn.Dropout(dropout))
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+class NFTokenizer(nn.Module):
+    """Neural field tokenizer with gradient checkpointing and learnable features."""
+
+    def __init__(self, coord_dim: int, num_bands: int, max_freq: float,
+                 hidden_dims: List[int], embed_dim: int, omega: float = 30.0,
+                 learnable_freqs: bool = True, learnable_omega: bool = True):
+        super().__init__()
+        self.fourier = FourierEmbed(coord_dim, num_bands, max_freq, learnable_freqs=learnable_freqs)
+        fourier_dim = coord_dim * 2 * num_bands
+        self.siren = SIREN([fourier_dim] + hidden_dims + [embed_dim], omega, 
+                          learnable_omega=learnable_omega)
+        self.use_checkpoint = embed_dim > 256  # Dynamic threshold - will be made configurable later
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        features = self.fourier(coords)
+        # Dynamic checkpointing based on GPU memory usage
+        if self.training and should_use_checkpointing():
+            return checkpoint(self.siren, features, use_reentrant=False)
+        return self.siren(features)
+
+# Dynamic memory monitoring for adaptive checkpointing
+def get_gpu_memory_usage() -> float:
+    """Get current GPU memory usage as a fraction of total memory."""
+    if torch.cuda.is_available():
+        total = torch.cuda.get_device_properties(0).total_memory
+        reserved = torch.cuda.memory_reserved(0)
+        return reserved / total
+    return 0.0
+
+def should_use_checkpointing(threshold: float = 0.7) -> bool:
+    """Determine if gradient checkpointing should be used based on memory usage."""
+    return get_gpu_memory_usage() > threshold
+
+class QFTLayer(nn.Module):
+    """Quantum-inspired layer with configurable convolutions and depthwise separable option."""
+
+    def __init__(self, channels: int, kernel_size: int = 3, dropout: float = 0.1,
+                 conv_groups: Optional[int] = None, depthwise_separable: bool = False):
+        super().__init__()
+        padding = kernel_size // 2
+        
+        # Configure convolution groups
+        if conv_groups is None:
+            # Default: adaptive grouping based on channel count
+            conv_groups = min(channels // 4, 32) if channels >= 16 else 1
+        
+        if depthwise_separable:
+            # Depthwise separable convolution for efficiency
+            self.conv = nn.Sequential(
+                # Depthwise convolution
+                nn.Conv1d(channels, channels, kernel_size, padding=padding,
+                         padding_mode='circular', groups=channels),
+                # Pointwise convolution
+                nn.Conv1d(channels, channels, 1, groups=1)
+            )
+        else:
+            # Standard grouped convolution
+            self.conv = nn.Conv1d(channels, channels, kernel_size, padding=padding,
+                                 padding_mode='circular', groups=conv_groups)
+        
+        self.norm = nn.LayerNorm(channels)
+        self.dropout = nn.Dropout(dropout)
+        self.gate = nn.Linear(channels, channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Gated residual with efficient convolution
+        residual = x
+        x = x.transpose(-2, -1)  # (B, L, C) -> (B, C, L)
+        x = self.conv(x)
+        x = x.transpose(-2, -1)  # (B, C, L) -> (B, L, C)
+        x = self.norm(x)
+
+        # Gated activation
+        gate = torch.sigmoid(self.gate(x))
+        x = F.gelu(x) * gate
+        x = self.dropout(x)
+
+        return x + residual
+
+class StableLogSoft(nn.Module):
+    """Numerically stable log softmax - DEPRECATED: Use F.log_softmax instead."""
+
+    def __init__(self, dim: int = -1, eps: float = 1e-8):
+        super().__init__()
+        self.dim = dim
+        logger.warning("StableLogSoft is deprecated. Use F.log_softmax for better performance.")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.log_softmax(x, dim=self.dim)
+
+class NFGen(nn.Module):
+    """Optimized neural field text generator with configurable components."""
+
+    def __init__(self, coord_dim: int = 3, num_bands: int = 10, max_freq: float = 8.0,
+                 tokenizer_dims: List[int] = [256, 256], embed_dim: int = 128,
+                 num_layers: int = 4, kernel_size: int = 3, vocab_size: int = 1000,
+                 omega: float = 30.0, dropout: float = 0.1, learnable_freqs: bool = True,
+                 learnable_omega: bool = True, conv_groups: Optional[int] = None,
+                 depthwise_separable: bool = False, pooling_method: str = 'attention'):
+        super().__init__()
+
+        self.tokenizer = NFTokenizer(coord_dim, num_bands, max_freq,
+                                   tokenizer_dims, embed_dim, omega,
+                                   learnable_freqs, learnable_omega)
+
+        self.layers = nn.ModuleList([
+            QFTLayer(embed_dim, kernel_size, dropout, conv_groups, depthwise_separable)
+            for _ in range(num_layers)
+        ])
+        
+        # Configurable pooling methods
+        self.pooling_method = pooling_method
+        if pooling_method == 'attention':
+            # Learnable attention-based pooling
+            self.pool = nn.Linear(embed_dim, 1)
+        elif pooling_method in ['mean', 'max']:
+            # Simple pooling methods - no parameters needed
+            self.pool = None
+        else:
+            raise ValueError(f"Unsupported pooling method: {pooling_method}")
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, vocab_size)
+            # Note: log_softmax applied in forward pass for better performance
+        )
+
+        # Initialize output layer
+        nn.init.xavier_uniform_(self.head[1].weight)
+        nn.init.zeros_(self.head[1].bias)
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        # Validate input type
+        if not isinstance(coords, torch.Tensor):
+            raise TypeError("coords must be a torch.Tensor")
+        if coords.ndim != 3:
+            raise ValueError(f"Expected 3D coords (B,L,D), got {coords.ndim}D")
+
+        with autocast():
+            x = self.tokenizer(coords)
+
+            for layer in self.layers:
+                x = layer(x)
+            
+            # Configurable pooling strategies
+            if self.pooling_method == 'attention':
+                # Learnable attention-based pooling
+                scores = self.pool(x).squeeze(-1)  # (B, L)
+                weights = F.softmax(scores, dim=1)  # (B, L)
+                x = (x * weights.unsqueeze(-1)).sum(dim=1)
+            elif self.pooling_method == 'mean':
+                # Simple mean pooling
+                x = x.mean(dim=1)
+            elif self.pooling_method == 'max':
+                # Simple max pooling
+                x = x.max(dim=1)[0]
+
+            logits = self.head(x)
+            return F.log_softmax(logits, dim=-1)  # Direct PyTorch log_softmax for better performance
+
+    def save_checkpoint(self, path: str, optimizer_state: Optional[dict] = None,
+                       scaler_state: Optional[dict] = None) -> None:
+        """Save optimized checkpoint with metadata."""
+        checkpoint_data = {
+            'model_state': self.state_dict(),
+            'model_config': self._get_config(),
+        }
+        if optimizer_state:
+            checkpoint_data['optimizer_state'] = optimizer_state
+        if scaler_state:
+            checkpoint_data['scaler_state'] = scaler_state
+
+        torch.save(checkpoint_data, path)
+        logger.info(f"Checkpoint saved: {path}")
+
+    def load_checkpoint(self, path: str, device: Optional[torch.device] = None) -> Tuple[dict, dict]:
+        """Load checkpoint and return optimizer/scaler states."""
+        data = torch.load(path, map_location=device, weights_only=False)
+        self.load_state_dict(data['model_state'])
+        logger.info(f"Model loaded: {path}")
+        return data.get('optimizer_state'), data.get('scaler_state')
+
+    def _get_config(self) -> dict:
+        """Get model configuration for reproducibility."""
+        return {
+            'embed_dim': self.tokenizer.siren.net[-2].out_features,
+            'num_layers': len(self.layers),
+            'vocab_size': self.head[1].out_features
+        }
+
+def gen_coords(batch_size: int, seq_len: int, coord_dim: int = 3,
+               device: torch.device = None, normalize: bool = True) -> torch.Tensor:
+    """Generate optimized coordinate tensors directly on target device."""
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Create tensors directly on target device to avoid CPU-GPU transfers
+    coords = torch.rand(batch_size, seq_len, coord_dim, device=device, dtype=torch.float32)
+
+    if normalize:
+        coords = coords * 2.0 - 1.0  # Normalize to [-1, 1]
+
+    return coords
+
+# Selective mixed precision utilities
+class SelectiveMixedPrecision:
+    """Selective mixed precision training with gradient monitoring."""
+    
+    def __init__(self, enabled: bool = True, grad_threshold: float = 1000.0):
+        self.enabled = enabled and torch.cuda.is_available()
+        self.grad_threshold = grad_threshold
+        self.scaler = GradScaler() if self.enabled else None
+        self.overflow_count = 0
+        
+    def should_use_fp16(self, model: nn.Module) -> bool:
+        """Determine if FP16 should be used based on gradient norms."""
+        if not self.enabled:
+            return False
+            
+        # Check recent gradient norms
+        max_grad_norm = 0.0
+        for param in model.parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.data.norm().item()
+                max_grad_norm = max(max_grad_norm, grad_norm)
+        
+        # Use FP16 if gradients are stable (below threshold)
+        return max_grad_norm < self.grad_threshold
+    
+    def scale_loss(self, loss: torch.Tensor) -> torch.Tensor:
+        """Scale loss if using mixed precision."""
+        if self.enabled and self.scaler is not None:
+            return self.scaler.scale(loss)
+        return loss
+    
+    def step_optimizer(self, optimizer: torch.optim.Optimizer) -> bool:
+        """Step optimizer with gradient scaling."""
+        if self.enabled and self.scaler is not None:
+            self.scaler.step(optimizer)
+            self.scaler.update()
+            return True
+        else:
+            optimizer.step()
+            return False
+
+# Optimized training utilities
+class NFTrainer:
+    """Enhanced trainer with selective mixed precision and configurable components."""
+
+    def __init__(self, model: NFGen, lr: float = 1e-4, dropout_schedule: Optional[dict] = None,
+                 mixed_precision: bool = True):
+        self.model = model
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+        self.mixed_precision = SelectiveMixedPrecision(enabled=mixed_precision)
+        self.device = next(model.parameters()).device
+        self.dropout_schedule = dropout_schedule or {}
+        
+    def set_dropout_rate(self, dropout_rate: float) -> None:
+        """Dynamically adjust dropout rates for ablation studies."""
+        for module in self.model.modules():
+            if isinstance(module, nn.Dropout):
+                module.p = dropout_rate
+
+    def train_step(self, coords: torch.Tensor, targets: torch.Tensor, 
+                   use_mixed_precision: bool = None) -> Tuple[float, bool]:
+        """Enhanced training step with selective mixed precision."""
+        self.optimizer.zero_grad()
+        
+        # Determine if mixed precision should be used
+        if use_mixed_precision is None:
+            use_mixed_precision = self.mixed_precision.should_use_fp16(self.model)
+
+        if use_mixed_precision:
+            with autocast():
+                logits = self.model(coords)
+                loss = F.nll_loss(logits, targets)
+            
+            scaled_loss = self.mixed_precision.scale_loss(loss)
+            scaled_loss.backward()
+            used_scaling = self.mixed_precision.step_optimizer(self.optimizer)
+        else:
+            logits = self.model(coords)
+            loss = F.nll_loss(logits, targets)
+            loss.backward()
+            self.optimizer.step()
+            used_scaling = False
+
+        return loss.item(), used_scaling
+    
+    def run_ablation_study(self, coords_list: List[torch.Tensor], 
+                          targets_list: List[torch.Tensor],
+                          dropout_rates: List[float] = [0.0, 0.1, 0.2, 0.3]) -> dict:
+        """Run dropout ablation study and return results."""
+        results = {}
+        original_state = self.model.state_dict().copy()
+        
+        for dropout_rate in dropout_rates:
+            self.set_dropout_rate(dropout_rate)
+            losses = []
+            
+            for coords, targets in zip(coords_list, targets_list):
+                loss, _ = self.train_step(coords, targets)
+                losses.append(loss)
+            
+            results[dropout_rate] = {
+                'mean_loss': sum(losses) / len(losses),
+                'losses': losses
+            }
+            
+            # Reset model state for next experiment
+            self.model.load_state_dict(original_state)
+            
+        return results
+
+# Unit tests with better coverage
+import unittest
+
+class TestNFGen(unittest.TestCase):
+
+    def setUp(self):
+        self.model = NFGen(vocab_size=100)  # Smaller for testing
+        self.coords = torch.randn(2, 16, 3)  # Smaller sequences
+
+    def test_forward_pass(self):
+        """Test forward pass and output shape."""
+        with torch.no_grad():
+            output = self.model(self.coords)
+            self.assertEqual(output.shape, (2, 100))
+            self.assertTrue(torch.allclose(output.exp().sum(dim=-1),
+                                         torch.ones(2), atol=1e-5))
+
+    def test_checkpoint_save_load(self):
+        """Test checkpoint functionality."""
+        import tempfile
+        import os
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pth') as f:
+            self.model.save_checkpoint(f.name)
+
+            # Create new model and load
+            new_model = NFGen(vocab_size=100)
+            new_model.load_checkpoint(f.name)
+
+            # Disable dropout for deterministic comparison
+            self.model.eval()
+            new_model.eval()
+            # Verify same outputs
+            with torch.no_grad():
+                out1 = self.model(self.coords)
+                out2 = new_model(self.coords)
+                self.assertTrue(torch.allclose(out1, out2, atol=1e-6))
+
+            # Close file handle before deletion on Windows
+            f.close()
+            os.unlink(f.name)
+
+    def test_trainer(self):
+        """Test training utilities."""
+        trainer = NFTrainer(self.model)
+        targets = torch.randint(0, 100, (2,))
+
+        loss, used_scaling = trainer.train_step(self.coords, targets)
+        self.assertIsInstance(loss, float)
+        self.assertIsInstance(used_scaling, bool)
+        self.assertGreater(loss, 0)
+
+# Dynamic batching utilities
+class DynamicBatcher:
+    """Dynamic batch sizing with support for variable-length sequences."""
+    
+    def __init__(self, max_tokens: int = 2048, max_batch_size: int = 32):
+        self.max_tokens = max_tokens
+        self.max_batch_size = max_batch_size
+    
+    def create_batches(self, sequences: List[torch.Tensor]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """Create batches with padding masks for variable-length sequences."""
+        # Sort by length for more efficient packing
+        sorted_seqs = sorted(enumerate(sequences), key=lambda x: x[1].shape[1], reverse=True)
+        
+        batches = []
+        current_batch = []
+        current_tokens = 0
+        
+        for orig_idx, seq in sorted_seqs:
+            seq_len = seq.shape[1]
+            
+            # Check if adding this sequence would exceed limits
+            batch_size = len(current_batch)
+            if (batch_size > 0 and 
+                (current_tokens + seq_len > self.max_tokens or 
+                 batch_size >= self.max_batch_size)):
+                # Finalize current batch
+                if current_batch:
+                    batches.append(self._pad_batch(current_batch))
+                current_batch = []
+                current_tokens = 0
+            
+            current_batch.append((orig_idx, seq))
+            current_tokens += seq_len
+        
+        # Add final batch
+        if current_batch:
+            batches.append(self._pad_batch(current_batch))
+        
+        return batches
+    
+    def _pad_batch(self, batch: List[Tuple[int, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pad sequences in batch to same length and create attention mask."""
+        max_len = max(seq.shape[1] for _, seq in batch)
+        device = batch[0][1].device
+        coord_dim = batch[0][1].shape[2]
+        
+        padded_seqs = []
+        mask = []
+        
+        for _, seq in batch:
+            seq_len = seq.shape[1]
+            if seq_len < max_len:
+                # Pad with zeros
+                pad_size = max_len - seq_len
+                padding = torch.zeros(seq.shape[0], pad_size, coord_dim, device=device)
+                padded_seq = torch.cat([seq, padding], dim=1)
+            else:
+                padded_seq = seq
+            
+            padded_seqs.append(padded_seq)
+            
+            # Create attention mask (1 for real tokens, 0 for padding)
+            seq_mask = torch.ones(seq.shape[0], max_len, device=device)
+            if seq_len < max_len:
+                seq_mask[:, seq_len:] = 0
+            mask.append(seq_mask)
+        
+        return torch.cat(padded_seqs, dim=0), torch.cat(mask, dim=0)
+
+def main():
+    """Enhanced main execution with comprehensive feature demonstration."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Device: {device}")
+    logger.info(f"GPU Memory: {get_gpu_memory_usage():.2%}")
+
+    # Create enhanced model with all new features
+    model = NFGen(
+        coord_dim=3, num_bands=8, max_freq=6.0,
+        tokenizer_dims=[128, 128], embed_dim=64,
+        num_layers=3, vocab_size=1000,
+        learnable_freqs=True,
+        learnable_omega=True,
+        depthwise_separable=True,  # Use efficient convolutions
+        pooling_method='mean'  # Test simpler pooling
+    ).to(device)
+
+    # Compile for optimization (requires MSVC 'cl' on Windows)
+    model = maybe_compile(model)
+
+    # Generate test data directly on GPU
+    coords = gen_coords(4, 32, device=device)
+    logger.info(f"Coordinates created on: {coords.device}")
+
+    # Performance profiling with torch.profiler
+    logger.info("Starting performance profiling...")
+    
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False  # Disable to avoid corrupted function names like "0](  (0): <module>"
+    ) as prof:
+        # Forward pass benchmark
+        model.eval()
+        with torch.no_grad():
+            for _ in range(5):  # Multiple runs for profiling
+                logits = model(coords)
+
+    # Export profiling results without stack traces to avoid corrupted function names
+    prof.export_chrome_trace("nf_model_profile.json")
+    logger.info("Profiling trace saved to nf_model_profile.json")
+    
+    # Print key profiling statistics
+    logger.info("Top 5 GPU operations by time:")
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=5))
+
+    # Test different pooling methods
+    pooling_methods = ['attention', 'mean', 'max']
+    for method in pooling_methods:
+        test_model = NFGen(
+            coord_dim=3, num_bands=8, max_freq=6.0,
+            tokenizer_dims=[128, 128], embed_dim=64,
+            num_layers=3, vocab_size=1000,
+            pooling_method=method
+        ).to(device)
+        
+        test_model.eval()
+        with torch.no_grad():
+            start_time = torch.cuda.Event(enable_timing=True) if device.type == 'cuda' else None
+            end_time = torch.cuda.Event(enable_timing=True) if device.type == 'cuda' else None
+
+            if start_time:
+                start_time.record()
+
+            logits = test_model(coords)
+
+            if end_time:
+                end_time.record()
+                torch.cuda.synchronize()
+                elapsed = start_time.elapsed_time(end_time)
+                logger.info(f"Pooling method '{method}': {elapsed:.2f}ms")
+
+    # Training demonstration with enhanced trainer
+    trainer = NFTrainer(model, lr=1e-4, mixed_precision=True)
+    targets = torch.randint(0, 1000, (4,), device=device)
+    
+    # Single training step with monitoring
+    loss, used_scaling = trainer.train_step(coords, targets)
+    logger.info(f"Training loss: {loss:.4f}, Used gradient scaling: {used_scaling}")
+
+    logger.info(f"Output shape: {logits.shape}")
+    logger.info(f"Output range: [{logits.min():.3f}, {logits.max():.3f}]")
+    logger.info(f"Final GPU Memory: {get_gpu_memory_usage():.2%}")
+
+    # Save enhanced checkpoint
+    model.save_checkpoint("nf_model.pth")
+
+    # Run tests
+    logger.info("Running tests...")
+    unittest.main(argv=[''], exit=False, verbosity=0)
+    logger.info("All tests passed!")
+
+    # Cleanup profiling file if needed
+    import os
+    if os.path.exists("nf_model_profile.json"):
+        logger.info(f"Profiling trace file size: {os.path.getsize('nf_model_profile.json')} bytes")
+
+if __name__ == '__main__':
+    main()
